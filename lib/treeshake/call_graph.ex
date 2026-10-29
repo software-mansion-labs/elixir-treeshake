@@ -1,0 +1,296 @@
+defmodule Treeshake.CallGraph do
+  @moduledoc false
+
+  # Creates a caller -> callee graph where nodes are only reachable functions (MFAs).
+
+  alias Treeshake.Utils.Graph
+
+  @type t :: Graph.t(mfa())
+
+  @protocol_built_in_types [
+    Tuple,
+    Atom,
+    List,
+    BitString,
+    Integer,
+    Float,
+    Function,
+    PID,
+    Map,
+    Port,
+    Reference,
+    Any
+  ]
+
+  @spec create(Treeshake.ModuleIndex.t(), [Treeshake.keep_entry()]) :: t()
+  def create(module_index, keep) do
+    protocols_impls =
+      Enum.flat_map(module_index, fn
+        {module, %{protocol_impl: {protocol, type}}} ->
+          case module_index[protocol] do
+            %{abstraction: {:protocol, _funs}} ->
+              [%{protocol: protocol, type: type, impl: module}]
+
+            nil ->
+              []
+
+            _non_protocol ->
+              raise "Module #{module} implements #{protocol} as if it was a protocol, but it's not"
+          end
+
+        _non_protocol ->
+          []
+      end)
+
+    protocols_impls = %{
+      by_protocol: Enum.group_by(protocols_impls, & &1.protocol),
+      by_type: Enum.group_by(protocols_impls, & &1.type)
+    }
+
+    behaviour_impls =
+      module_index
+      |> Enum.flat_map(fn {module, %{behaviour_impls: behaviours}} ->
+        Enum.map(behaviours, &%{module: module, behaviour: &1})
+      end)
+      |> Enum.group_by(& &1.behaviour, & &1.module)
+
+    {kept_if_referenced, keep} =
+      Enum.split_with(keep, &match?({:referenced_modules_defining, _fun_arity}, &1))
+
+    kept_if_referenced = Enum.map(kept_if_referenced, fn {_kind, fun_arity} -> fun_arity end)
+
+    keep =
+      keep
+      |> Enum.flat_map(fn
+        {:behaviour_impls, behaviour} ->
+          behaviour_impls |> Map.get(behaviour, []) |> Enum.map(&{:mod, &1})
+
+        entry ->
+          [entry]
+      end)
+      |> Enum.flat_map(fn
+        {:mfa, mfa} ->
+          [mfa]
+
+        # Ignored if it's not there
+        {:mod, m} ->
+          case module_index[m] do
+            nil -> []
+            info -> Enum.map(info.public_functions, fn {{f, a}, _info} -> {m, f, a} end)
+          end
+      end)
+
+    bfs_acc = %{
+      graph: %{},
+      protocol_calls: MapSet.new(),
+      referenced_modules: MapSet.new(@protocol_built_in_types)
+    }
+
+    Graph.bfs(keep, bfs_acc, &visit(&1, &2, module_index, protocols_impls, kept_if_referenced)).graph
+  end
+
+  defp visit({m, f, a} = mfa, acc, module_index, protocols_impls, kept_if_referenced) do
+    function_info =
+      get_in(module_index[m].public_functions[{f, a}]) || %{calls: [], potential_modules: []}
+
+    do_visit(mfa, function_info, acc, module_index, protocols_impls, kept_if_referenced)
+  end
+
+  defp do_visit(
+         {_m, f, a} = mfa,
+         function_info,
+         acc,
+         module_index,
+         protocols_impls,
+         kept_if_referenced
+       ) do
+    %{
+      graph: graph,
+      protocol_calls: acc_protocol_calls,
+      referenced_modules: acc_referenced_modules
+    } = acc
+
+    # impl_for references all implementations when protocol is consolidated
+    potential_modules =
+      if {f, a} in [impl_for: 1, impl_for!: 1], do: [], else: function_info.potential_modules
+
+    referenced_modules_info =
+      Enum.flat_map(
+        potential_modules,
+        &case module_index[&1] do
+          nil -> []
+          info -> [info]
+        end
+      )
+
+    acc_referenced_modules =
+      MapSet.union(
+        acc_referenced_modules,
+        MapSet.new(referenced_modules_info, & &1.module)
+      )
+
+    behaviour_calls = find_behaviour_calls(referenced_modules_info, module_index)
+    child_spec_calls = find_child_spec_calls(referenced_modules_info)
+    generated_funs = find_generated_funs(referenced_modules_info)
+    kept_calls = find_kept_if_referenced(referenced_modules_info, kept_if_referenced)
+
+    calls = Enum.flat_map(function_info.calls, &expand_module_call(&1, module_index))
+
+    all_calls =
+      (calls ++ behaviour_calls ++ child_spec_calls ++ generated_funs ++ kept_calls)
+      |> Enum.reject(&(&1 == mfa))
+
+    {protocol_entries, acc_protocol_calls} =
+      find_protocol_calls(
+        all_calls,
+        acc_protocol_calls,
+        acc_referenced_modules,
+        referenced_modules_info,
+        protocols_impls,
+        module_index
+      )
+
+    graph =
+      graph
+      |> merge_graph([{mfa, all_calls}])
+      |> merge_graph(protocol_entries)
+
+    acc = %{
+      graph: graph,
+      protocol_calls: acc_protocol_calls,
+      referenced_modules: acc_referenced_modules
+    }
+
+    {all_calls ++ Enum.flat_map(protocol_entries, &value/1), acc}
+  end
+
+  defp expand_module_call({m, f, :any}, module_index) do
+    case module_index[m] do
+      nil -> []
+      info -> for {{^f, a}, _info} <- info.public_functions, do: {m, f, a}
+    end
+  end
+
+  defp expand_module_call({_m, _f, _a} = mfa, _module_index), do: [mfa]
+
+  defp expand_module_call(module, module_index) do
+    case module_index[module] do
+      nil -> []
+      info -> Enum.map(info.public_functions, fn {{f, a}, _info} -> {module, f, a} end)
+    end
+  end
+
+  defp find_behaviour_calls(referenced_modules_info, module_index) do
+    referenced_modules_info
+    |> Enum.flat_map(fn info ->
+      Enum.map(info.behaviour_impls, &{info.module, &1})
+    end)
+    |> Enum.flat_map(fn {module, behaviour} ->
+      case module_index[behaviour] do
+        %{abstraction: {:behaviour, callbacks}} ->
+          callbacks
+
+        nil ->
+          []
+
+        _non_behaviour ->
+          raise "Module #{module} implements #{behaviour} as if it was a behaviour, but it's not"
+      end
+      |> Enum.map(fn {f, a} -> {module, f, a} end)
+    end)
+  end
+
+  # When a module atom appears as a literal (e.g. passed to Supervisor.start_link),
+  # the supervisor will call child_spec/1 on it at runtime — add that edge explicitly.
+  defp find_child_spec_calls(referenced_modules_info) do
+    referenced_modules_info
+    |> Enum.filter(fn info -> Map.has_key?(info.public_functions, {:child_spec, 1}) end)
+    |> Enum.map(fn info -> {info.module, :child_spec, 1} end)
+  end
+
+  # A module implementing a behaviour typically gets it with `use`, whose macros
+  # generate functions that the behaviour's library calls on the module, like
+  # __live__/0 of LiveComponents. They're kept whenever the module is referenced.
+  defp find_generated_funs(referenced_modules_info) do
+    referenced_modules_info
+    |> Enum.filter(fn info -> info.behaviour_impls != [] end)
+    |> Enum.flat_map(fn info ->
+      info.macro_generated
+      |> Enum.filter(&Map.has_key?(info.public_functions, &1))
+      |> Enum.reject(fn {f, _a} -> f == :__struct__ end)
+      |> Enum.map(fn {f, a} -> {info.module, f, a} end)
+    end)
+  end
+
+  # A referenced module defining any of the functions is kept whole, see
+  # Treeshake's `keep` option
+  defp find_kept_if_referenced(referenced_modules_info, fun_arities) do
+    for info <- referenced_modules_info,
+        Enum.any?(fun_arities, &Map.has_key?(info.public_functions, &1)),
+        {{f, a}, _info} <- info.public_functions,
+        do: {info.module, f, a}
+  end
+
+  # A protocol callback implementation impl_mod.fun is included when both conditions are met:
+  # - impl_mod is referenced
+  # - protocol function (protocol.fun) is called
+  defp find_protocol_calls(
+         all_calls,
+         acc_protocol_calls,
+         acc_referenced_modules,
+         referenced_modules_info,
+         protocols_impls,
+         module_index
+       ) do
+    protocol_edges_from_calls =
+      all_calls
+      |> Enum.filter(fn {cm, cf, ca} ->
+        case get_in(module_index[cm].abstraction) do
+          {:protocol, funs} -> {cf, ca} in funs
+          _other -> false
+        end
+      end)
+      |> Enum.flat_map(fn {cm, cf, ca} ->
+        Map.fetch!(protocols_impls.by_protocol, cm)
+        |> Enum.filter(&(&1.type in acc_referenced_modules))
+        |> Enum.map(&{{&1.protocol, cf, ca}, {&1.impl, cf, ca}})
+      end)
+
+    acc_protocol_calls =
+      MapSet.union(acc_protocol_calls, MapSet.new(protocol_edges_from_calls, &key/1))
+
+    protocol_edges_from_modules =
+      referenced_modules_info
+      |> Enum.flat_map(fn info -> Map.get(protocols_impls.by_type, info.module, []) end)
+      |> Enum.flat_map(fn %{protocol: protocol, impl: impl} ->
+        Map.fetch!(module_index, impl).public_functions
+        |> Map.keys()
+        |> Enum.filter(fn {f, a} -> {protocol, f, a} in acc_protocol_calls end)
+        |> Enum.map(fn {f, a} -> {{protocol, f, a}, {impl, f, a}} end)
+      end)
+
+    protocol_entries =
+      Enum.group_by(
+        protocol_edges_from_modules ++ protocol_edges_from_calls,
+        &key/1,
+        &value/1
+      )
+
+    {protocol_entries, acc_protocol_calls}
+  end
+
+  defp merge_graph(graph, to_merge) do
+    Enum.reduce(to_merge, graph, fn {k, v}, acc ->
+      case Map.fetch(acc, k) do
+        {:ok, v2} -> v ++ v2
+        :error -> v
+      end
+      |> Enum.sort()
+      |> Enum.dedup()
+      |> then(&Map.put(acc, k, &1))
+    end)
+  end
+
+  defp key({k, _v}), do: k
+  defp value({_k, v}), do: v
+end
