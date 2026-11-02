@@ -72,6 +72,32 @@ defmodule Treeshake.ReachabilityTest do
     assert :not_schema_like in stats.modules_removed
   end
 
+  @tag :tmp_dir
+  test "gen_statem implementations keep all public functions and their dependencies by default",
+       %{
+         tmp_dir: tmp_dir,
+         ebin_files: ebin_files
+       } do
+    output = Path.join(tmp_dir, "output")
+
+    Treeshake.run(
+      ebin_files: ebin_files,
+      output_dir: output,
+      keep: [mfa: {StateMachineImpl, :start_link, 0}]
+    )
+
+    state_functions = functions(output, StateMachineImpl)
+    assert {:idle, 3} in state_functions
+    assert {:active, 3} in state_functions
+    assert {:extra_api, 0} in state_functions
+    assert {:reply, 0} in state_functions
+
+    dependency_functions = functions(output, StateMachineDependency)
+    assert {:reply, 0} in dependency_functions
+    assert {:extra, 0} in dependency_functions
+    refute {:unused, 0} in dependency_functions
+  end
+
   # Kernel and stdlib modules are left by default, even if unreachable, except
   # the ones tree-shaken like others
   @tag :tmp_dir

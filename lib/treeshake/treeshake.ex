@@ -107,6 +107,7 @@ defmodule Treeshake do
     :sofs
   ]
 
+  @default_keep [behaviour_impls: :gen_statem]
   @default_ignore [mod: :prim_eval]
 
   @hardcoded %{
@@ -385,7 +386,9 @@ defmodule Treeshake do
       raise "No entry points found"
     end
 
-    Map.new(opts)
+    opts
+    |> keyword_concat_default(:keep, @default_keep)
+    |> Map.new()
   end
 
   defp detect_entry_points(app_files) do
