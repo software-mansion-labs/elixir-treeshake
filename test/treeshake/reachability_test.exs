@@ -47,6 +47,12 @@ defmodule Treeshake.ReachabilityTest do
     # The custom validator in a NimbleOptions schema
     assert functions(output, :options_schema) == [schema: 0, validate: 2]
 
+    # The arity of a function referenced with an argument list depends on
+    # the code calling it, so all functions of the name are kept, unlike
+    # with an arity
+    assert functions(output, :mfa_tuples) ==
+             [exact: 1, parse: 1, run: 1, spawned: 1, specs: 1, start_link: 2]
+
     # Kernel.struct!/2 calls __struct__/1 of its module, Kernel.struct/2
     # __struct__/0
     assert functions(output, :struct_module) == [__struct__: 1]

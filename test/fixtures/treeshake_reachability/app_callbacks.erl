@@ -6,6 +6,7 @@ start(_Type, _Args) ->
     struct_builder:build(),
     spawner:start(),
     options_schema:schema(),
+    mfa_tuples:specs([]),
     persistent_term:put(generated_impl, 'Elixir.GeneratedImpl'),
     persistent_term:put(schema, schema_like),
     {ok, self()}.

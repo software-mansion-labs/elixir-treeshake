@@ -181,7 +181,7 @@ defmodule Treeshake do
   - callbacks of applications' modules (`start/2`, `stop/1`, etc.)
   - functions called or captured (`&Module.fun/arity`) by a reachable function
   - functions referenced as a hard-coded module-function-arity (MFA) tuple
-    or module-function-arguments tuple in a reachable function
+    or module-function-arguments tuple (keeps all arities) in a reachable function
   - callback implementations of behaviours, if their module is referenced
     in a reachable function
   - macro-generated functions in modules implementing behaviours, if the module
