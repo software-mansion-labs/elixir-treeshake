@@ -285,19 +285,6 @@ defmodule Treeshake.Utils.BeamAnalyzer do
     own ++ collect_calls(arity_expr)
   end
 
-  # Hardcoded MFA tuple folded into a c_literal by the compiler:
-  # {:c_literal, _, {m, f, arity}} — arity may be an integer or an argument list
-  defp collect_calls({:c_literal, _, {m, f, arity}})
-       when is_atom(m) and is_atom(f) and is_integer(arity) and arity >= 0 do
-    [{m, f, arity}]
-  end
-
-  # MFA with argument list rather than integer arity: {m, f, [arg1, ...]}
-  defp collect_calls({:c_literal, _, {m, f, args}})
-       when is_atom(m) and is_atom(f) and is_list(args) do
-    [{m, f, length(args)}]
-  end
-
   # Atom literal — may be a module reference used in dynamic dispatch.
   defp collect_calls({:c_literal, _, v}) when is_atom(v), do: [v]
 
@@ -352,7 +339,9 @@ defmodule Treeshake.Utils.BeamAnalyzer do
       [{m, f, arity}] ++
         collect_calls(args_expr) ++ collect_calls(rest)
     else
-      _other -> collect_calls(all_args)
+      # Arguments known only at runtime
+      :error -> [{m, f, :any}] ++ collect_calls(all_args)
+      false -> collect_calls(all_args)
     end
   end
 
@@ -381,15 +370,16 @@ defmodule Treeshake.Utils.BeamAnalyzer do
     |> Enum.flat_map(fn {k, v} -> collect_literal_atoms(k) ++ collect_literal_atoms(v) end)
   end
 
-  # Detect MFA tuples nested inside complex literals (e.g. supervisor child specs
-  # folded into a single c_literal by the compiler).
+  # Detect MFA tuples folded into a c_literal by the compiler, also when nested
+  # inside complex literals (e.g. supervisor child specs). See mfa_arity/1 for
+  # the arity of argument lists.
   defp collect_literal_atoms({m, f, arity})
        when is_atom(m) and is_atom(f) and is_integer(arity) and arity >= 0,
        do: [{m, f, arity}]
 
   defp collect_literal_atoms({m, f, args})
        when is_atom(m) and is_atom(f) and is_list(args),
-       do: [{m, f, length(args)}]
+       do: [{m, f, :any}]
 
   # Treats neighbouring atoms in a tuple as a module and function.
   # Pairs are left out: they're mostly keyword list entries, or
@@ -422,11 +412,15 @@ defmodule Treeshake.Utils.BeamAnalyzer do
 
   defp collect_literal_atoms(_), do: []
 
+  # An argument list doesn't determine the arity, which depends on the code
+  # calling the function: for example, simple_one_for_one supervisors append
+  # arguments to it, and httpc passes the list itself as the only argument.
   defp mfa_arity({:c_literal, _, a}) when is_integer(a) and a >= 0, do: {:ok, a}
-
-  defp mfa_arity(list_expr) do
-    count_list(list_expr)
-  end
+  defp mfa_arity({:c_literal, _, args}) when is_list(args), do: {:ok, :any}
+  # A list built at runtime, or a variable that may hold one
+  defp mfa_arity({:c_cons, _, _head, _tail}), do: {:ok, :any}
+  defp mfa_arity({:c_var, _, _name}), do: {:ok, :any}
+  defp mfa_arity(_other), do: :error
 
   defp count_list({:c_literal, _, []}), do: {:ok, 0}
   defp count_list({:c_literal, _, list}) when is_list(list), do: {:ok, length(list)}
